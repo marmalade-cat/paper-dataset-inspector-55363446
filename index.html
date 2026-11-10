@@ -1,0 +1,132 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Paper Dataset Inspector</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:18px;color:#222}
+    input[type=text]{width:70%}
+    button{margin-left:8px}
+    pre{background:#f6f6f8;padding:10px;border-radius:6px;overflow:auto}
+    .file{border:1px solid #e4e4e8;padding:8px;margin:8px 0;border-radius:6px}
+  </style>
+</head>
+<body>
+  <h2>Paper Dataset Inspector</h2>
+  <p>Paste a paper page or PDF URL. The tool will fetch the resource, look for links to CSV/TSV/JSON/ZIP, and try to fetch headers and a small sample.</p>
+  <div>
+    <input id="url" type="text" placeholder="https://example.org/paper.html or .../paper.pdf" />
+    <button id="go">Inspect</button>
+  </div>
+  <div id="out"></div>
+
+<script>
+const out = id('out');
+const go = id('go');
+go.onclick = async()=>{
+  out.innerHTML='';
+  let u = id('url').value.trim();
+  if(!u){out.textContent='Enter a URL.';return}
+  append('Fetching: '+u);
+  try{
+    const resp = await fetch(u);
+    append('HTTP '+resp.status+' '+resp.statusText);
+    const ctype = resp.headers.get('content-type') || '';
+    append('Content-Type: '+ctype);
+    if(ctype.includes('html')){
+      const txt = await resp.text();
+      inspectHtml(u, txt);
+    } else if(ctype.includes('pdf') || u.toLowerCase().endsWith('.pdf')){
+      const buf = await resp.arrayBuffer();
+      inspectPdfBuffer(u, new Uint8Array(buf));
+    } else {
+      append('Unsupported top-level content type. Will try to parse as text.');
+      const txt = await resp.text();
+      inspectHtml(u, txt);
+    }
+  }catch(e){
+    append('Fetch error: '+e.message+'\nNote: CORS may block cross-origin fetches when running locally or from a different origin.');
+  }
+}
+
+function id(i){return document.getElementById(i)}
+function append(s){const p=document.createElement('pre');p.textContent=s;out.appendChild(p)}
+
+function inspectHtml(baseUrl, html){
+  append('Scanning HTML for dataset links...');
+  const links = Array.from(html.matchAll(/href\s*=\s*"([^"]+)"/gi)).map(m=>m[1])
+    .concat(Array.from(html.matchAll(/href\s*=\s*'([^']+)'/gi)).map(m=>m[1]));
+  const candidates = links
+    .map(h=>new URL(h, baseUrl).href)
+    .filter(h=>h.match(/\.(csv|tsv|json|zip)(\?|$)/i) || h.match(/download|dataset|data/gi));
+  append('Found '+candidates.length+' candidate links. Showing up to 20.');
+  (candidates.slice(0,20)).forEach(fetchAndInspect);
+}
+
+async function fetchAndInspect(fileUrl){
+  const d = document.createElement('div'); d.className='file'; out.appendChild(d);
+  d.innerHTML = `<strong>${fileUrl}</strong>`;
+  try{
+    const resp = await fetch(fileUrl, {method:'GET'});
+    d.appendChild(pre('HTTP '+resp.status+' '+resp.statusText));
+    const headers = {};
+    for(const [k,v] of resp.headers) headers[k]=v;
+    d.appendChild(pre('Headers: '+JSON.stringify(headers, null, 2)));
+    const ctype = resp.headers.get('content-type') || '';
+    if(ctype.includes('json') || fileUrl.match(/\.json(\?|$)/i)){
+      const text = await resp.text();
+      try{const j = JSON.parse(text); d.appendChild(pre('JSON keys/sample:\n'+JSON.stringify(sampleJson(j), null, 2)))}catch(e){d.appendChild(pre('Invalid JSON or parse error. Showing raw sample:\n'+text.slice(0,400))) }
+    } else if(ctype.includes('csv') || fileUrl.match(/\.(csv|tsv)(\?|$)/i) || ctype.includes('text')){
+      const text = await resp.text();
+      const rows = text.split(/\r?\n/).slice(0,6).join('\n');
+      d.appendChild(pre('Sample rows:\n'+rows));
+    } else if(ctype.includes('zip') || fileUrl.match(/\.zip(\?|$)/i)){
+      d.appendChild(pre('ZIP file detected. Fetching first 16KB for signature inspection...'));
+      const rb = await resp.arrayBuffer();
+      const u8 = new Uint8Array(rb.slice(0,16384));
+      d.appendChild(pre('First bytes (hex): '+Array.from(u8.slice(0,16)).map(x=>x.toString(16).padStart(2,'0')).join(' ')));
+      d.appendChild(pre('ZIP detection: '+(u8[0]==0x50 && u8[1]==0x4b ? 'likely ZIP (PK..)':'unknown')));
+    } else {
+      const text = await resp.text();
+      d.appendChild(pre('Unknown type. First 400 chars:\n'+text.slice(0,400)));
+    }
+  }catch(e){
+    d.appendChild(pre('Fetch error: '+e.message+'\n(CORS or network)'));
+  }
+}
+
+function pre(s){const p=document.createElement('pre');p.textContent=s;return p}
+
+function sampleJson(j){
+  if(Array.isArray(j)) return j.slice(0,3);
+  if(j && typeof j==='object'){
+    const keys = Object.keys(j).slice(0,10);
+    const out = {};
+    keys.forEach(k=>{out[k]=shortSample(j[k])});
+    return out;
+  }
+  return j;
+}
+function shortSample(v){ if(Array.isArray(v)) return v.slice(0,3); if(typeof v==='object') return Object.keys(v).slice(0,5); return v }
+
+// Simple PDF scan: look for ASCII links inside the PDF bytes
+function inspectPdfBuffer(url, u8){
+  append('Scanning PDF for HTTP/HTTPS links and embedded filenames...');
+  const s = bytesToAscii(u8);
+  const matches = Array.from(s.matchAll(/https?:\/\/[^\s)"<>\]]+/gi)).map(m=>m[0]);
+  const unique = Array.from(new Set(matches));
+  append('Found '+unique.length+' URL-like strings. Showing up to 30.');
+  unique.slice(0,30).forEach(fetchAndInspect);
+}
+
+function bytesToAscii(u8){
+  let s='';
+  for(let i=0;i<u8.length;i++){
+    const c = u8[i];
+    if(c>=32 && c<127) s+=String.fromCharCode(c); else s+=' ';
+  }
+  return s;
+}
+</script>
+</body>
+</html>
